@@ -2,8 +2,8 @@ name: Daily Tech & AI Newsletter
 
 on:
   schedule:
-    - cron: '30 6 * * *'  # 06:30 UTC -> 08:30 l'été
-    - cron: '30 7 * * *'  # 07:30 UTC -> 08:30 l'hiver
+    - cron: '30 6 * * *'  # 08:30 CEST
+    - cron: '30 7 * * *'  # 08:30 CET
   workflow_dispatch: {}
 
 jobs:
@@ -37,8 +37,10 @@ jobs:
           TIMEZONE: Europe/Paris
           TARGET_HOUR: '8'
           TARGET_MINUTE: '30'
-
         run: |
           echo "TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}" >> .env
           echo "TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}" >> .env
+          echo "TIMEZONE=${TIMEZONE}" >> .env
+          echo "TARGET_HOUR=${TARGET_HOUR}" >> .env
+          echo "TARGET_MINUTE=${TARGET_MINUTE}" >> .env
           python main.py
