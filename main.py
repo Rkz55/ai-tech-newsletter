@@ -1,9 +1,11 @@
 import os
 import smtplib
 import ssl
+import json
 from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from zoneinfo import ZoneInfo
 
 import feedparser
 import yaml
@@ -11,6 +13,8 @@ import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
+
+# --- Utilitaires ---
 def strip_html(html: str) -> str:
     if not html:
         return ""
@@ -65,18 +69,17 @@ def build_html(items: list, template: str, title: str, lookback: int) -> str:
         desc = first_sentences(desc, 2)
         source = strip_html(it.get("source", {}).get("title", it.get("author", "")))
         source = source or (it.get("feedburner_origlink") and "FeedBurner") or ""
-        block = f"""
+        return f"""
         <div class="item">
           <a class="title" href="{link}">{title}</a>
           <p>{desc}</p>
           <div class="source">{source}</div>
         </div>
         """
-        return block
 
     items_html = "\n".join(item_html(i) for i in items)
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    html = (
+    return (
         template
         .replace("{{TITLE}}", title)
         .replace("{{DATE}}", now)
@@ -84,25 +87,54 @@ def build_html(items: list, template: str, title: str, lookback: int) -> str:
         .replace("{{COUNT}}", str(len(items)))
         .replace("{{ITEMS}}", items_html)
     )
-    return html
 
 def send_email(smtp_host: str, smtp_port: int, smtp_user: str, smtp_pass: str, from_addr: str, to_addr: str, subject: str, html_body: str):
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"] = from_addr
     msg["To"] = to_addr
-
-    part_html = MIMEText(html_body, "html", "utf-8")
-    msg.attach(part_html)
-
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
     context = ssl.create_default_context()
     with smtplib.SMTP(smtp_host, smtp_port) as server:
         server.starttls(context=context)
         server.login(smtp_user, smtp_pass)
         server.sendmail(from_addr, [to_addr], msg.as_string())
 
+def load_history(path="history.json"):
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return set(json.load(f))
+        except Exception:
+            return set()
+    return set()
+
+def save_history(seen_links, path="history.json", limit=1000):
+    data = list(seen_links)[-limit:]
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+def categorize(item, buckets):
+    text = (item.get("title") or "") + " " + (item.get("summary") or "")
+    text = text.lower()
+    for bucket, keywords in buckets.items():
+        if any(k in text for k in keywords):
+            return bucket
+    return "Autres"
+
+
+# --- Script principal ---
 if __name__ == "__main__":
     load_dotenv()
+
+    # Vérifier l'heure locale
+    TZ = os.getenv("TIMEZONE", "Europe/Paris")
+    TARGET_HOUR = int(os.getenv("TARGET_HOUR", "8"))
+    TARGET_MINUTE = int(os.getenv("TARGET_MINUTE", "30"))
+    now_local = datetime.now(ZoneInfo(TZ))
+    if not (now_local.hour == TARGET_HOUR and now_local.minute == TARGET_MINUTE):
+        print(f"[SKIP] {now_local.isoformat()} != {TARGET_HOUR:02d}:{TARGET_MINUTE:02d} ({TZ})")
+        raise SystemExit(0)
 
     EMAIL_ENABLED = os.getenv("EMAIL_ENABLED", "true").lower() == "true"
     TELEGRAM_ENABLED = os.getenv("TELEGRAM_ENABLED", "false").lower() == "true"
@@ -121,18 +153,31 @@ if __name__ == "__main__":
     LOOKBACK = int(os.getenv("LOOKBACK_HOURS", "24"))
     MAX_ITEMS = int(os.getenv("MAX_ITEMS", "12"))
 
+    BUCKETS = {
+        "IA": ["ai","artificial intelligence","llm","openai","deepseek","anthropic","llama","gpt"],
+        "Cybersécurité": ["cyber","ransom","breach","malware","phishing","zero-day","cve","exploit","vuln"],
+        "Matériel/PC": ["cpu","gpu","nvidia","amd","intel","chip","silicon","pc","laptop","ssd"],
+        "Web/Dev": ["javascript","python","typescript","github","framework","api","cloud","aws","gcp","azure"],
+    }
+
     config = load_yaml("feeds.yaml")
     template = load_template("templates/email_template.html")
 
+    # Chargement historique
+    history = load_history()
+
+    # Collecte
     items = []
     for url in config.get("feeds", []):
         try:
             for entry in fetch_items(url):
                 if within_lookback(entry.get("published_parsed"), LOOKBACK):
-                    items.append(entry)
+                    if entry.get("link") and entry.get("link") not in history:
+                        items.append(entry)
         except Exception as e:
             print(f"[WARN] {url}: {e}")
 
+    # Déduplication courante
     seen = set()
     uniq = []
     for it in items:
@@ -143,13 +188,13 @@ if __name__ == "__main__":
 
     uniq = uniq[:MAX_ITEMS]
 
+    # Construire HTML
     html = build_html(uniq, template, TITLE, LOOKBACK)
-
-    out_path = "newsletter.html"
-    with open(out_path, "w", encoding="utf-8") as f:
+    with open("newsletter.html", "w", encoding="utf-8") as f:
         f.write(html)
-    print(f"[OK] Newsletter générée -> {out_path}")
+    print("[OK] Newsletter générée -> newsletter.html")
 
+    # Email (si activé)
     if EMAIL_ENABLED and SMTP_HOST and SMTP_USER and SMTP_PASS and EMAIL_TO:
         try:
             send_email(
@@ -160,14 +205,26 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"[ERR] Envoi email: {e}")
 
+    # Envoi Telegram par catégorie
     if TELEGRAM_ENABLED and TG_TOKEN and TG_CHAT:
-        try:
-            lines = [f"{TITLE} — {len(uniq)} actus"]
-            for it in uniq:
+        grouped = {}
+        for it in uniq:
+            bucket = categorize(it, BUCKETS)
+            grouped.setdefault(bucket, []).append(it)
+
+        total_sent = 0
+        for bucket, arr in grouped.items():
+            if not arr:
+                continue
+            lines = [f"{TITLE} — {bucket} — {len(arr)} actus"]
+            for it in arr:
                 t = strip_html(it.get("title", "(sans titre)"))
                 link = it.get("link", "")
                 lines.append(f"• {t}\n{link}")
             telegram_send(TG_TOKEN, TG_CHAT, "\n\n".join(lines))
-            print("[OK] Telegram envoyé.")
-        except Exception as e:
-            print(f"[ERR] Telegram: {e}")
+            total_sent += len(arr)
+        print(f"[OK] Telegram envoyé ({total_sent} articles, {len(grouped)} catégories).")
+
+    # Mise à jour historique
+    history.update([it.get("link") for it in uniq if it.get("link")])
+    save_history(history)
