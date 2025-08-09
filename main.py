@@ -147,14 +147,6 @@ if __name__ == "__main__":
     LOOKBACK = int(os.getenv("LOOKBACK_HOURS", "24"))
     MAX_ITEMS = int(os.getenv("MAX_ITEMS", "12"))
 
-    # Vérification de l'heure locale
-    TZ = os.getenv("TIMEZONE", "Europe/Paris")
-    TARGET_HOUR = int(os.getenv("TARGET_HOUR", "8"))
-    TARGET_MINUTE = int(os.getenv("TARGET_MINUTE", "30"))
-    now_local = datetime.now(ZoneInfo(TZ))
-    if not (now_local.hour == TARGET_HOUR and now_local.minute == TARGET_MINUTE):
-        print(f"[SKIP] {now_local.isoformat()} != {TARGET_HOUR:02d}:{TARGET_MINUTE:02d} ({TZ})")
-        raise SystemExit(0)
 
     config = load_yaml("feeds.yaml")
     template = load_template("templates/email_template.html")
