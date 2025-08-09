@@ -10,10 +10,9 @@ import yaml
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from zoneinfo import ZoneInfo
-import json
 
 
+# ---------- Utils ----------
 def strip_html(html: str) -> str:
     if not html:
         return ""
@@ -23,8 +22,7 @@ def strip_html(html: str) -> str:
 def first_sentences(text: str, max_sentences: int = 2) -> str:
     if not text:
         return ""
-    parts = []
-    start = 0
+    parts, start = [], 0
     for i, ch in enumerate(text):
         if ch in ".!?":
             parts.append(text[start:i+1].strip())
@@ -54,11 +52,20 @@ def within_lookback(published_parsed, lookback_hours: int) -> bool:
     return published_dt >= datetime.utcnow() - timedelta(hours=lookback_hours)
 
 def telegram_send(token: str, chat_id: str, text: str):
-    requests.post(
+    """Envoie un message Telegram et lève une erreur si l'API refuse."""
+    r = requests.post(
         f"https://api.telegram.org/bot{token}/sendMessage",
         json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True},
-        timeout=15,
+        timeout=20,
     )
+    # Vérifie proprement la réponse
+    try:
+        data = r.json()
+    except Exception:
+        raise RuntimeError(f"Telegram HTTP {r.status_code}: {r.text[:200]}")
+    if not data.get("ok"):
+        # Exemple: {'ok': False, 'error_code': 400, 'description': 'Bad Request: chat not found'}
+        raise RuntimeError(f"Telegram API error: {data}")
 
 def build_html(items: list, template: str, title: str, lookback: int) -> str:
     def item_html(it):
@@ -68,18 +75,17 @@ def build_html(items: list, template: str, title: str, lookback: int) -> str:
         desc = first_sentences(desc, 2)
         source = strip_html(it.get("source", {}).get("title", it.get("author", "")))
         source = source or (it.get("feedburner_origlink") and "FeedBurner") or ""
-        block = f"""
+        return f"""
         <div class="item">
           <a class="title" href="{link}">{title}</a>
           <p>{desc}</p>
           <div class="source">{source}</div>
         </div>
         """
-        return block
 
     items_html = "\n".join(item_html(i) for i in items)
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    html = (
+    return (
         template
         .replace("{{TITLE}}", title)
         .replace("{{DATE}}", now)
@@ -87,16 +93,13 @@ def build_html(items: list, template: str, title: str, lookback: int) -> str:
         .replace("{{COUNT}}", str(len(items)))
         .replace("{{ITEMS}}", items_html)
     )
-    return html
 
 def send_email(smtp_host: str, smtp_port: int, smtp_user: str, smtp_pass: str, from_addr: str, to_addr: str, subject: str, html_body: str):
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"] = from_addr
     msg["To"] = to_addr
-
-    part_html = MIMEText(html_body, "html", "utf-8")
-    msg.attach(part_html)
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
 
     context = ssl.create_default_context()
     with smtplib.SMTP(smtp_host, smtp_port) as server:
@@ -104,29 +107,8 @@ def send_email(smtp_host: str, smtp_port: int, smtp_user: str, smtp_pass: str, f
         server.login(smtp_user, smtp_pass)
         server.sendmail(from_addr, [to_addr], msg.as_string())
 
-def load_history(path="history.json"):
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                return set(json.load(f))
-        except Exception:
-            return set()
-    return set()
 
-def save_history(seen_links, path="history.json", limit=1000):
-    data = list(seen_links)[-limit:]
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-def categorize(item, buckets):
-    text = (item.get("title") or "") + " " + (item.get("summary") or "")
-    text = text.lower()
-    for bucket, keywords in buckets.items():
-        if any(k in text for k in keywords):
-            return bucket
-    return "Autres"
-
-
+# ---------- Main ----------
 if __name__ == "__main__":
     load_dotenv()
 
@@ -147,10 +129,10 @@ if __name__ == "__main__":
     LOOKBACK = int(os.getenv("LOOKBACK_HOURS", "24"))
     MAX_ITEMS = int(os.getenv("MAX_ITEMS", "12"))
 
-
     config = load_yaml("feeds.yaml")
     template = load_template("templates/email_template.html")
 
+    # Collecte des articles
     items = []
     for url in config.get("feeds", []):
         try:
@@ -160,6 +142,7 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"[WARN] {url}: {e}")
 
+    # Déduplication simple
     seen = set()
     uniq = []
     for it in items:
@@ -168,15 +151,16 @@ if __name__ == "__main__":
             seen.add(link)
             uniq.append(it)
 
+    # Limite
     uniq = uniq[:MAX_ITEMS]
 
+    # Génère HTML (archive locale)
     html = build_html(uniq, template, TITLE, LOOKBACK)
-
-    out_path = "newsletter.html"
-    with open(out_path, "w", encoding="utf-8") as f:
+    with open("newsletter.html", "w", encoding="utf-8") as f:
         f.write(html)
-    print(f"[OK] Newsletter générée -> {out_path}")
+    print("[OK] Newsletter générée -> newsletter.html")
 
+    # Email (désactivé dans ton workflow par défaut)
     if EMAIL_ENABLED and SMTP_HOST and SMTP_USER and SMTP_PASS and EMAIL_TO:
         try:
             send_email(
@@ -187,6 +171,7 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"[ERR] Envoi email: {e}")
 
+    # Telegram (avec vérif d'erreurs)
     if TELEGRAM_ENABLED and TG_TOKEN and TG_CHAT:
         try:
             lines = [f"{TITLE} — {len(uniq)} actus"]
@@ -194,7 +179,13 @@ if __name__ == "__main__":
                 t = strip_html(it.get("title", "(sans titre)"))
                 link = it.get("link", "")
                 lines.append(f"• {t}\n{link}")
+
+            masked = TG_TOKEN[:7] + "..." + TG_TOKEN[-4:] if len(TG_TOKEN) > 12 else "****"
+            print(f"[DEBUG] Envoi Telegram → chat_id={TG_CHAT}, token={masked}")
+
             telegram_send(TG_TOKEN, TG_CHAT, "\n\n".join(lines))
             print("[OK] Telegram envoyé.")
         except Exception as e:
             print(f"[ERR] Telegram: {e}")
+    else:
+        print("[INFO] Telegram désactivé ou secrets manquants.")
