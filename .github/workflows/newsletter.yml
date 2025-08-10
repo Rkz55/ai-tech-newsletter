@@ -3,7 +3,7 @@ name: Daily Tech & AI Newsletter
 on:
   schedule:
     - cron: '30 6 * * *'  # 08:30 CEST
-    - cron: '30 7 * * *'  # 08:30 CET
+    
   workflow_dispatch: {}
 
 jobs:
